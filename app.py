@@ -1,13 +1,13 @@
 
-# app.py — Prospect Scraper (Streamlit) with Filters + Include-only Keywords
-import re, time
+# app.py — Prospect Scraper (Streamlit) with Pagination + Per-domain cap
+import re, time, math
 from io import StringIO
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 
-USER_AGENT = "ProspectScraper/0.4 (+contact: your-email@example.com)"
+USER_AGENT = "ProspectScraper/0.5 (+contact: your-email@example.com)"
 EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 CONTACT_KEYWORDS = ["contact", "contact us", "about", "editor", "pitch", "media", "press", "submit", "guidelines"]
 
@@ -32,13 +32,20 @@ def domain_allowed(domain: str, allowed_tlds_only: bool) -> bool:
         return domain.endswith(".com") or domain.endswith(".org")
     return True
 
-def serpapi_search(query, api_key, num=20):
+def serpapi_search(query, api_key, num=10, start=0):
+    # Google via SerpAPI: supports 'num' (up to 100) and 'start' (offset)
     endpoint = "https://serpapi.com/search.json"
     r = requests.get(
         endpoint,
-        params={"q": query, "engine": "google", "api_key": api_key, "num": min(num, 100)},
+        params={
+            "q": query,
+            "engine": "google",
+            "api_key": api_key,
+            "num": max(1, min(int(num), 100)),
+            "start": max(0, int(start)),
+        },
         headers={"User-Agent": USER_AGENT},
-        timeout=20,
+        timeout=25,
     )
     r.raise_for_status()
     data = r.json()
@@ -102,14 +109,20 @@ with st.sidebar:
     st.markdown("**Engine**: SerpAPI (Google)")
     serp_key = st.text_input("SERPAPI_API_KEY", type="password", help="Your SerpAPI key (not stored).")
     niche = st.text_input("Niche / Topic", value="digital marketing")
-    limit = st.slider("Results per query", 10, 100, 25, 5)
-    delay = st.slider("Delay between requests (sec)", 0.0, 5.0, 1.5, 0.5)
+    # Pagination controls
+    st.markdown("### Search size")
+    results_per_page = st.slider("Results per page (num)", 10, 100, 20, 10)
+    pages = st.slider("Pages per query", 1, 5, 2, 1, help="Each page advances 'start' offset. Mind your SerpAPI quota.")
+    delay = st.slider("Delay between requests (sec)", 0.0, 5.0, 1.0, 0.5)
+
     st.markdown("---")
     st.subheader("Filters")
     excludes_str = st.text_input("Exclude domains (comma-separated)", DEFAULT_EXCLUDES)
     only_com_org = st.checkbox("Only include .com or .org", value=True)
     include_str = st.text_input("Include-only keywords (comma-separated)", DEFAULT_INCLUDES,
-                                help="Results must contain at least one of these terms in title, URL, or snippet.")
+                                help="Must match title, URL, or snippet.")
+    max_per_domain = st.number_input("Max results per domain", min_value=1, max_value=10, value=1, step=1,
+                                     help="Set >1 if you want multiple URLs from the same site.")
     run = st.button("Run search")
 
 if run:
@@ -125,14 +138,21 @@ if run:
         status = st.empty()
         all_results = []
         queries = search_queries(niche)
-        for i, q in enumerate(queries, 1):
-            status.write(f"Searching: {q}")
-            try:
-                all_results += serpapi_search(q, serp_key, num=limit)
-            except Exception as e:
-                st.warning(f"Search failed for '{q}': {e}")
-            progress.progress(int(i / len(queries) * 33))
-            time.sleep(delay)
+
+        total_loops = len(queries) * pages
+        loop_index = 0
+
+        for q in queries:
+            for p in range(pages):
+                start = p * results_per_page
+                status.write(f"Searching: {q} (page {p+1}/{pages}, start={start})")
+                try:
+                    all_results += serpapi_search(q, serp_key, num=results_per_page, start=start)
+                except Exception as e:
+                    st.warning(f"Search failed for '{q}' page {p+1}: {e}")
+                loop_index += 1
+                progress.progress(int(loop_index / max(1, total_loops) * 33))
+                time.sleep(delay)
 
         # 1) Dedupe URLs
         seen_urls, deduped = set(), []
@@ -141,7 +161,7 @@ if run:
             if url and url not in seen_urls:
                 seen_urls.add(url); deduped.append(r)
 
-        # 2) Apply include-only & exclude & TLD BEFORE domain-level dedupe
+        # 2) Apply include-only & exclude & TLD BEFORE domain-level limiting
         filtered = []
         for r in deduped:
             d = extract_domain(r["url"])
@@ -155,17 +175,21 @@ if run:
                 continue
             filtered.append(r)
 
-        # 3) One result per domain
-        seen_domains, per_domain = set(), []
+        # 3) Cap results per domain
+        domain_counts = {}
+        per_domain = []
         for r in filtered:
             d = extract_domain(r["url"])
-            if d and d not in seen_domains:
-                seen_domains.add(d); per_domain.append(r)
+            c = domain_counts.get(d, 0)
+            if c < max_per_domain:
+                per_domain.append(r)
+                domain_counts[d] = c + 1
 
         rows = []
+        total = len(per_domain)
         for i, item in enumerate(per_domain, 1):
             url = item["url"]; title = item.get("title", ""); snippet = item.get("snippet", "")
-            status.write(f"Visiting ({i}/{len(per_domain)}): {url}")
+            status.write(f"Visiting ({i}/{total}): {url}")
             html = fetch_html(url)
             emails = extract_emails(html) if html else []
             contacts = []
@@ -180,10 +204,10 @@ if run:
                 "emails": ";".join(emails[:5]),
                 "contact_links": ";".join(contacts),
             })
-            progress.progress(33 + int(i / len(per_domain) * 67))
+            progress.progress(33 + int(i / max(1, total) * 67))
             time.sleep(delay)
 
-        st.success(f"Done! Collected {len(rows)} prospects after filtering.")
+        st.success(f"Done! Collected {len(rows)} prospects after filtering & pagination.")
         st.dataframe(rows, use_container_width=True)
 
         # CSV download

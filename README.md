@@ -1,9 +1,12 @@
-# Prospect Scraper (Streamlit) — Include-only Keywords
+# Prospect Scraper (Streamlit) — Pagination Edition
 
-Adds:
-- **Exclude domains** (comma-separated)
-- **Only include .com/.org** checkbox
-- **Include-only keywords**: results must contain at least one term in **title/URL/snippet**
+**New:** Fetch multiple pages per query + cap results per domain.
+
+## What's new
+- **Results per page (num)**: up to 100 per query page
+- **Pages per query**: up to 5 (uses SerpAPI `start` offset)
+- **Max results per domain**: keep more than 1 URL from the same site if desired
+- Works with your existing: excludes, .com/.org filter, include-only keywords
 
 ## Run locally
 ```bash
